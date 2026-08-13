@@ -1,13 +1,111 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Get a free hosted Postgres database in seconds: `npx create-db`
-
 generator client {
-  provider = "prisma-client"
-  output   = "../generated/prisma"
+  provider = "prisma-client-js"
 }
 
 datasource db {
   provider = "postgresql"
+}
+
+// -----------------------------------------------------
+// USER PROFILE
+// Authentication is handled by Neon Auth.
+// This table stores application-specific user information.
+// -----------------------------------------------------
+model UserProfile {
+  id         String   @id @default(uuid())
+  authUserId String   @unique
+  fullName   String?
+  role       UserRole @default(MEMBER)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  conversations Conversation[]
+
+  @@map("user_profiles")
+}
+
+// -----------------------------------------------------
+// DOCUMENTS
+// The 8 official Student Builder Group documents.
+// -----------------------------------------------------
+
+model Document {
+  id          String         @id @default(uuid())
+  title       String
+  fileName    String         @unique
+  description String?
+  status      DocumentStatus @default(ACTIVE)
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  chunks DocumentChunk[]
+
+  @@map("documents")
+}
+
+// -----------------------------------------------------
+// DOCUMENT CHUNKS
+// RAG splits each document into smaller searchable pieces.
+// embedding uses PostgreSQL pgvector.
+// -----------------------------------------------------
+
+model DocumentChunk {
+  id           String                       @id @default(uuid())
+  documentId   String
+  chunkIndex   Int
+  content      String
+  sectionTitle String?
+  embedding    Unsupported("vector(1024)")?
+  createdAt    DateTime                     @default(now())
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@unique([documentId, chunkIndex])
+  @@index([documentId])
+  @@map("document_chunks")
+}
+
+// -----------------------------------------------------
+// CHAT
+// -----------------------------------------------------
+
+model Conversation {
+  id        String   @id @default(uuid())
+  userId    String
+  title     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     UserProfile @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages Message[]
+
+  @@index([userId])
+  @@map("conversations")
+}
+
+model Message {
+  id             String   @id @default(uuid())
+  conversationId String
+  role           String
+  content        String
+  createdAt      DateTime @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId])
+  @@map("messages")
+}
+
+// -----------------------------------------------------
+// ENUMS
+// -----------------------------------------------------
+
+enum UserRole {
+  MEMBER
+  ADMIN
+}
+
+enum DocumentStatus {
+  ACTIVE
+  INACTIVE
 }
