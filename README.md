@@ -1,384 +1,1940 @@
-# Club Member Portal
+# Club Member Portal Chatbot — Cloud RAG Implementation Documentation
 
-A members-only **AWS Student Builder Groups Club Member Portal** built with React, Express, Neon Auth, Prisma, and PostgreSQL/Neon.
+## 1. Purpose
 
-The portal provides authenticated member access to club knowledge, a document-grounded chatbot, conversation history, source citations, and a document publishing/re-indexing workflow for administrators.
+This document is a long-term reference for the chatbot implementation in the Club Member Portal.
 
-## Project Status
+The chatbot uses the project's existing React frontend, Express backend, Neon Auth authentication, Prisma/PostgreSQL database, Admin document-management flow, document chunks, and existing conversation/message system. The current implementation uses Google Gemini as the cloud AI provider and PostgreSQL pgvector for semantic RAG.
 
-The existing 70% portal is working, and the backend document publishing/re-indexing foundation for the remaining 30% is implemented and tested.
+The main separation is:
 
-### Implemented
+- `rag.service.js` retrieves relevant information.
+- `ai.js` generates the answer.
+- `chat.service.js` coordinates retrieval, AI, fallback, sources, and persistence.
 
-- Email/password authentication with Neon Auth UI.
-- Protected member routes.
-- Member dashboard, profile, settings, documents, and chat pages.
-- PostgreSQL persistence through Prisma.
-- Eight starter club documents loaded through the Prisma seed process.
-- `Document` → `DocumentChunk` data model for retrieval.
-- Lexical RAG over active document chunks.
-- Local grounded answer generation through `config/ai.js`.
-- Conversation and message persistence.
-- Source metadata returned with chatbot responses.
-- Campus AWS Student Builder contact fallback when retrieval is weak.
-- Admin role support through `UserProfile.role` (`MEMBER` / `ADMIN`).
-- Admin document publish/update APIs.
-- Markdown-to-chunk conversion during publish/update.
-- Transactional document re-indexing.
-- Verified flow: publish a new document → create chunks → chatbot retrieves the new content.
+This separation keeps the implementation ready for a future Amazon Bedrock provider.
 
-### Remaining hackathon integration
+---
 
-The onsite 30% phase still requires the final admin frontend, automatic member document-list refresh, the evaluator `POST /ask` API on port `8080`, event-day briefing data, smoke tests, and event-Wi-Fi validation.
+# 2. Big Picture
 
-## Architecture
+When a member asks:
+
+> How do I publish on Builder Center?
+
+the current flow is:
 
 ```text
-Member Browser
-    |
-    v
-React / Vite
-    |
-    |  apiFetch() + Neon Auth token
-    v
-Express Backend (:5000 currently)
-    |
-    +--------------------+
-    |                    |
-    v                    v
-Authentication         Modules
-    |                    |
-    v                    +-- Chat
-Neon Auth               +-- Users
-                         +-- Documents
-                              |
-                              v
-                         Document Service
-                              |
-                              v
-                  Document -> DocumentChunk[]
-                              |
-                              v
-                         PostgreSQL / Prisma
-                              |
-                              v
-                         RAG Service
-                              |
-                              v
-                            ai.js
-                              |
-                              v
-                       Grounded answer
-```
-
-### Chat flow
-
-```text
-Chat page
-   ↓
-useChat / apiFetch
-   ↓
-POST /api/chat
-   ↓
-JWT verification
-   ↓
+User
+  |
+  v
+ChatInput.jsx
+  |
+  v
+useChat.js
+  |
+  v
+lib/api.js
+  |
+  | POST /api/chat
+  | Authorization: Bearer <JWT>
+  v
+chat.routes.js
+  |
+  v
+auth middleware
+  |
+  | verify JWT through Neon Auth JWKS
+  v
 chat.controller.js
-   ↓
+  |
+  v
+users.service.js
+  |
+  | auth user -> UserProfile
+  v
 chat.service.js
-   ├── rag.service.js
-   │      ↓
-   │   DocumentChunk search
-   │      ↓
-   │   relevant chunks
-   │
-   └── config/ai.js
-          ↓
-     grounded local answer
-   ↓
-answer + sources + fallback
-   ↓
-Prisma Message
-   ↓
-React UI
+  |
+  +-----------------------------+
+  |                             |
+  v                             v
+rag.service.js                ai.js
+  |                             |
+  | Gemini query embedding      | Gemini cloud generation
+  v                             |
+Neon PostgreSQL                 |
+pgvector                        |
+  |                             |
+  +---- relevant chunks --------+
+                |
+                v
+        grounded answer + sources
+                |
+                v
+        Prisma Message
+                |
+                v
+          HTTP response
+                |
+                v
+            useChat.js
+                |
+                v
+          ChatWindow.jsx
+                |
+                v
+          ChatMessage.jsx
+                |
+                v
+        SourceCitation.jsx
+                |
+                v
+               User
 ```
 
-## Technology Stack
+### Document indexing flow
 
-### Frontend
+The Admin Panel is also the RAG knowledge-base management interface.
 
-- React 19
+```text
+Admin creates/edits document
+        |
+        v
+Publish / Update
+        |
+        v
+documents.service.js
+        |
+        +--> split Markdown into logical chunks
+        |
+        +--> Gemini embedding for every chunk
+        |
+        v
+768-dimensional vectors
+        |
+        v
+DocumentChunk + embedding
+        |
+        v
+Neon PostgreSQL + pgvector
+```
+
+No local LLM is used. No separate vector database is required.
+
+# 3. Technologies
+
+## Frontend
+
+- React
 - React Router
-- Vite
-- Neon Auth UI
-- CSS
+- `apiFetch()` for backend communication
+- `MemberLayout`
+- React hooks/state
+- `chat.css`
 
-### Backend
+## Backend
 
 - Node.js
-- Express 5
-- Prisma 7
-- PostgreSQL / Neon
-- `jose` for JWT/JWKS verification
-- Local lexical RAG
-- Local AI provider abstraction
+- Express
+- `jose` for JWT verification
+- Prisma
+- PostgreSQL/Neon
+- PostgreSQL `pgvector`
+- `@google/genai` for Gemini API access
 
-## Folder Structure
+## Cloud AI / RAG
 
-```text
-Aws-Club/
-│
-├── frontend/
-│   ├── src/
-│   │   ├── components/
-│   │   │   ├── common/
-│   │   │   │   ├── AuthProvider.jsx
-│   │   │   │   └── MemberLayout.jsx
-│   │   │   └── common/chat/
-│   │   │       ├── ChatInput.jsx
-│   │   │       ├── ChatMessage.jsx
-│   │   │       ├── ChatWindow.jsx
-│   │   │       └── SourceCitation.jsx
-│   │   ├── hooks/
-│   │   │   └── useChat.js
-│   │   ├── lib/
-│   │   │   ├── api.js
-│   │   │   └── auth.js
-│   │   ├── pages/
-│   │   │   ├── auth/
-│   │   │   │   ├── Login.jsx
-│   │   │   │   ├── Register.jsx
-│   │   │   │   ├── ForgotPassword.jsx
-│   │   │   │   └── ResetPassword.jsx
-│   │   │   └── member/
-│   │   │       ├── Dashboard.jsx
-│   │   │       ├── Chat.jsx
-│   │   │       ├── Chats.jsx
-│   │   │       ├── Documents.jsx
-│   │   │       ├── Profile.jsx
-│   │   │       ├── ProfileTest.jsx
-│   │   │       └── Settings.jsx
-│   │   ├── routes/
-│   │   │   ├── AppRoutes.jsx
-│   │   │   └── ProtectedRoute.jsx
-│   │   └── styles/
-│   │       ├── auth.css
-│   │       ├── chat.css
-│   │       └── portal.css
-│   ├── .env
-│   └── package.json
-│
-├── backend/
-│   ├── src/
-│   │   ├── config/
-│   │   │   ├── ai.js
-│   │   │   └── db.js
-│   │   ├── middleware/
-│   │   │   ├── auth.js
-│   │   │   └── error.js
-│   │   ├── modules/
-│   │   │   ├── users/
-│   │   │   ├── chat/
-│   │   │   └── documents/
-│   │   ├── rag/
-│   │   │   └── rag.service.js
-│   │   ├── app.js
-│   │   └── server.js
-│   ├── prisma/
-│   │   ├── schema.prisma
-│   │   ├── seed.js
-│   │   └── migrations/
-│   ├── documents/
-│   │   └── 01-08 starter Markdown files
-│   ├── templates/
-│   ├── .env
-│   └── package.json
-│
-├── docs/
-└── README.md
-```
+- Cloud LLM: Google Gemini API
+- Chat model configured in the project: `gemini-3.5-flash`
+- Embedding model configured in the project: `gemini-embedding-001`
+- Embedding dimension: 768
+- Retrieval: PostgreSQL pgvector similarity search
+- Document embedding task: `RETRIEVAL_DOCUMENT`
+- Query embedding task: `RETRIEVAL_QUERY`
 
-## Data Model
+The backend keeps the Gemini API key in `.env`; the React frontend never receives the key.
 
-The portal uses the existing Prisma/PostgreSQL model:
-
-```text
-UserProfile
-  ├── authUserId
-  ├── fullName
-  └── role (MEMBER | ADMIN)
-
-Document
-  └── DocumentChunk[]
-
-DocumentChunk
-  ├── documentId
-  ├── chunkIndex
-  ├── sectionTitle
-  ├── content
-  └── optional embedding field
-
-Conversation
-  └── Message[]
-```
+> **Implementation note:** The current code in `src/config/ai.js` uses the Gemini SDK's `models.generateContent()` method for answer generation. The Interactions API is not currently implemented in the uploaded project. If the API is migrated later, this documentation must be updated again.
 
 ## Authentication
 
 Neon Auth provides the member identity and JWT.
 
-The backend verifies the JWT with the Neon Auth JWKS endpoint before protected requests are processed.
+The backend verifies the JWT using the Neon Auth JWKS endpoint.
 
-Admin document operations additionally check the authenticated user's `UserProfile.role`.
+## Database
 
-Use `ADMIN` only for accounts that should be allowed to publish or update club documents.
+Prisma connects to PostgreSQL through the existing `PrismaPg` adapter.
 
-## Environment Variables
+The chatbot reuses the existing database. No second chatbot database is required.
 
-### Backend `.env`
+The `DocumentChunk.embedding` field is configured in Prisma as:
 
-Create `backend/.env` with values appropriate for your Neon/Auth project:
+```prisma
+embedding Unsupported("vector(768)")?
+```
+
+The actual PostgreSQL column must therefore be `vector(768)`.
+
+# 4. Database Data Used by the Chatbot
+
+Important models:
+
+```text
+UserProfile
+Document
+DocumentChunk
+Conversation
+Message
+```
+
+## Document
+
+A `Document` is one official club source file.
+
+The current eight files are:
+
+```text
+01-onboarding-faq.md
+02-aws-account-setup.md
+03-builder-center-publish.md
+04-bedrock-starter.md
+05-hackathon-rules.md
+06-workshop-index.md
+07-lambda-patterns.md
+08-sbg-community.md
+```
+
+## DocumentChunk
+
+A document is divided into logical searchable chunks.
+
+A chunk contains:
+
+```text
+documentId
+sectionTitle
+content
+chunkIndex
+embedding
+```
+
+The `embedding` is a 768-dimensional vector generated by `gemini-embedding-001`.
+
+The RAG service searches these chunks.
+
+## Conversation
+
+A conversation is one chat thread:
+
+```text
+Conversation
+  |
+  +-- user message
+  +-- assistant message
+  +-- user message
+  +-- assistant message
+```
+
+## Message
+
+Each user question and assistant answer is stored as a message in the conversation.
+
+This is what supports Recent Chats / My Chats and conversation history.
+
+---
+
+# 5. Full Project Folder Structure
+
+The following structure is based on the current project repository. Generated/runtime folders such as `.git`, `node_modules`, and build output are intentionally omitted.
+
+```text
+Aws-Club/
+│
+├── README.md
+├── .gitignore
+│
+├── backend/
+│   ├── .gitignore
+│   ├── package.json
+│   ├── package-lock.json
+│   ├── prisma.config.ts
+│   ├── skills-lock.json
+│   │
+│   ├── templates/
+│   │   ├── aws-builder-center-article.md
+│   │   └── demo-checklist.md
+│   │
+│   ├── documents/
+│   │   ├── 01-onboarding-faq.md
+│   │   ├── 02-aws-account-setup.md
+│   │   ├── 03-builder-center-publish.md
+│   │   ├── 04-bedrock-starter.md
+│   │   ├── 05-hackathon-rules.md
+│   │   ├── 06-workshop-index.md
+│   │   ├── 07-lambda-patterns.md
+│   │   └── 08-sbg-community.md
+│   │
+│   ├── prisma/
+│   │   ├── schema.prisma
+│   │   ├── seed.js
+│   │   └── migrations/
+│   │       ├── 20260811162329_init/
+│   │       │   └── migration.sql
+│   │       ├── 20260811183657_add_chat/
+│   │       │   └── migration.sql
+│   │       └── migration_lock.toml
+│   │
+│   └── src/
+│       ├── app.js
+│       ├── server.js
+│       │
+│       ├── config/
+│       │   ├── ai.js
+│       │   └── db.js
+│       │
+│       ├── middleware/
+│       │   ├── auth.js
+│       │   └── error.js
+│       │
+│       ├── rag/
+│       │   └── rag.service.js
+│       │
+│       └── modules/
+│           ├── auth/
+│           │   └── [authentication module files as added]
+│           │
+│           ├── users/
+│           │   ├── users.controller.js
+│           │   ├── users.routes.js
+│           │   └── users.service.js
+│           │
+│           ├── chat/
+│           │   ├── chat.controller.js
+│           │   ├── chat.routes.js
+│           │   └── chat.service.js
+│           │
+│           └── documents/
+│               ├── documents.controller.js
+│               ├── documents.routes.js
+│               └── documents.service.js
+│
+└── frontend/
+    ├── README.md
+    ├── package.json
+    ├── package-lock.json
+    ├── vite.config.js
+    ├── eslint.config.js
+    ├── index.html
+    │
+    ├── public/
+    │   ├── favicon.svg
+    │   └── icons.svg
+    │
+    └── src/
+        ├── main.jsx
+        ├── App.jsx
+        ├── App.css
+        ├── index.css
+        │
+        ├── components/
+        │   └── common/
+        │       ├── AuthProvider.jsx
+        │       ├── MemberLayout.jsx
+        │       └── chat/
+        │           ├── ChatInput.jsx
+        │           ├── ChatMessage.jsx
+        │           ├── ChatWindow.jsx
+        │           └── SourceCitation.jsx
+        │
+        ├── hooks/
+        │   └── useChat.js
+        │
+        ├── lib/
+        │   ├── api.js
+        │   └── auth.js
+        │
+        ├── pages/
+        │   ├── Landing.jsx
+        │   ├── auth/
+        │   │   ├── ForgotPassword.jsx
+        │   │   ├── Login.jsx
+        │   │   ├── Register.jsx
+        │   │   └── ResetPassword.jsx
+        │   │
+        │   └── member/
+        │       ├── AdminDocuments.jsx
+        │       ├── Chat.jsx
+        │       ├── Chats.jsx
+        │       ├── Dashboard.jsx
+        │       ├── Documents.jsx
+        │       ├── Profile.jsx
+        │       ├── ProfileTest.jsx
+        │       └── Settings.jsx
+        │
+        ├── routes/
+        │   ├── AppRoutes.jsx
+        │   └── ProtectedRoute.jsx
+        │
+        └── styles/
+            ├── auth.css
+            ├── chat.css
+            └── portal.css
+```
+
+### Important folders for RAG
+
+```text
+backend/src/rag/
+    rag.service.js
+        ↓
+    semantic retrieval
+
+backend/src/config/
+    ai.js
+        ↓
+    Gemini embeddings + answer generation
+
+backend/src/modules/documents/
+    documents.service.js
+        ↓
+    chunking + embedding when Admin publishes/updates
+
+backend/prisma/
+    schema.prisma
+        ↓
+    Document + DocumentChunk + vector(768)
+
+backend/documents/
+    *.md
+        ↓
+    seed/reference document files
+```
+
+### Frontend chatbot files
+
+```text
+frontend/src/pages/member/Chat.jsx
+        ↓
+frontend/src/hooks/useChat.js
+        ↓
+frontend/src/lib/api.js
+        ↓
+POST /api/chat
+        ↓
+backend
+```
+
+# 6. Frontend Responsibilities
+
+## `Chat.jsx`
+
+Main chat page.
+
+Responsibilities:
+
+- compose the chat screen
+- render the conversation list
+- call `useChat()`
+- render `ChatWindow`
+- render `ChatInput`
+- show errors
+
+It should not contain Prisma, RAG, or AI logic.
+
+Mental model:
+
+```text
+Chat.jsx = page composition
+```
+
+## `ChatInput.jsx`
+
+Responsibilities:
+
+- textbox
+- Send button
+- Enter-to-send
+- disable while loading
+
+Flow:
+
+```text
+User types
+   |
+   v
+ChatInput
+   |
+   v
+onSend(question)
+```
+
+Mental model:
+
+```text
+ChatInput = collect the question
+```
+
+## `useChat.js`
+
+Frontend chatbot state manager.
+
+Maintains:
+
+```text
+messages
+conversations
+conversationId
+loading
+error
+```
+
+Uses `apiFetch()` to call:
+
+```text
+POST /api/chat
+```
+
+Also loads conversation history and existing messages.
+
+Mental model:
+
+```text
+useChat = frontend state + API communication
+```
+
+## `ChatWindow.jsx`
+
+Displays:
+
+- messages
+- empty state
+- loading/thinking state
+- latest-message scrolling
+
+Mental model:
+
+```text
+ChatWindow = message list
+```
+
+## `ChatMessage.jsx`
+
+Renders one user or assistant message.
+
+For assistant messages it also passes source information to `SourceCitation`.
+
+Mental model:
+
+```text
+ChatMessage = one message renderer
+```
+
+## `SourceCitation.jsx`
+
+Displays source metadata separately:
+
+```text
+Sources
+
+03-builder-center-publish.md
+Section: Publishing
+```
+
+Sources come from retrieved chunk metadata, not from the AI inventing filenames.
+
+Mental model:
+
+```text
+SourceCitation = evidence display
+```
+
+## `lib/api.js`
+
+Generic frontend HTTP helper.
+
+Responsibilities:
+
+1. build backend URL
+2. retrieve the current JWT
+3. add the Authorization header
+4. make the request
+5. parse JSON
+6. raise an error for failed HTTP responses
+
+Mental model:
+
+```text
+api.js = frontend/backend bridge
+```
+
+## `MemberLayout.jsx`
+
+Common member shell:
+
+- sidebar
+- header
+- navigation
+- logout
+- page container
+
+Chat is rendered inside:
+
+```jsx
+<MemberLayout>
+  ...
+</MemberLayout>
+```
+
+Mental model:
+
+```text
+MemberLayout = common member UI
+```
+
+---
+
+# 7. Backend Responsibilities
+
+## `chat.routes.js`
+
+Maps URLs to controller functions.
+
+Important endpoints:
+
+```text
+POST /api/chat
+POST /api/chat/conversations
+GET  /api/chat/conversations
+POST /api/chat/ask
+GET  /api/chat/conversations/:id/messages
+POST /api/chat/conversations/:id/messages
+```
+
+The router applies the existing authentication middleware to the chat routes.
+
+Mental model:
+
+```text
+chat.routes.js = traffic controller
+```
+
+## `auth.js`
+
+Authentication boundary.
+
+Input:
+
+```text
+Authorization: Bearer <JWT>
+```
+
+The middleware:
+
+1. verifies that a Bearer token exists
+2. verifies the JWT signature
+3. obtains the signing key from Neon Auth JWKS
+4. validates the token
+5. places identity information into `req.user`
+
+Example shape:
+
+```js
+req.user = {
+  id,
+  email,
+  name
+};
+```
+
+Mental model:
+
+```text
+auth.js = who are you?
+```
+
+## `users.service.js`
+
+Maps the authenticated Neon user to the application's `UserProfile`.
+
+The important operation is:
+
+```text
+getOrCreateProfile(authUserId, fullName)
+```
+
+Conceptually:
+
+```text
+Neon Auth user
+      |
+      | authUserId
+      v
+UserProfile
+```
+
+Mental model:
+
+```text
+users.service.js = identity bridge
+```
+
+## `chat.controller.js`
+
+HTTP/controller layer.
+
+Flow:
+
+```text
+HTTP request
+    |
+    v
+validate input
+    |
+    v
+get authenticated profile
+    |
+    v
+call chat.service.js
+    |
+    v
+send HTTP response
+```
+
+It should not perform RAG or AI generation directly.
+
+Mental model:
+
+```text
+controller = HTTP adapter
+```
+
+---
+
+# 8. `chat.service.js` — Main Chatbot Orchestrator
+
+This is the most important backend file.
+
+It coordinates:
+
+```text
+Conversation
+RAG
+AI
+Fallback
+Sources
+Message persistence
+```
+
+Flow:
+
+```text
+question
+   |
+   v
+find/create conversation
+   |
+   v
+RAG search
+   |
+   +-------- no relevant result --------+
+   |                                     |
+   |                                     v
+   |                                  fallback
+   |
+   +-------- relevant result -----------+
+                                         |
+                                         v
+                                      ai.js
+                                         |
+                                         v
+                                      answer
+                                         |
+                                         v
+                                   save messages
+                                         |
+                                         v
+                                  return response
+```
+
+Mental model:
+
+```text
+chat.service.js = chatbot manager
+```
+
+---
+
+# 9. Conversation Handling
+
+When a question arrives, `chat.service.js` checks for `conversationId`.
+
+## Existing conversation
+
+```text
+conversationId exists
+        |
+        v
+find conversation for current user
+        |
+        v
+continue conversation
+```
+
+## New conversation
+
+```text
+no conversationId
+        |
+        v
+create Conversation
+```
+
+The title is based on the start of the question.
+
+This preserves the existing Recent Chats / My Chats functionality.
+
+---
+
+# 10. `rag.service.js` — Retrieval
+
+This is the search engine of the chatbot.
+
+It ONLY retrieves information.
+
+It does not:
+
+- render React
+- verify authentication
+- save messages
+- generate the final answer
+- know about the UI
+
+Mental model:
+
+```text
+rag.service.js = search official club documents
+```
+
+---
+
+# 11. How the Current Semantic RAG Works
+
+The original prototype used local lexical/keyword matching. The uploaded project has now been changed to semantic vector retrieval.
+
+### Document indexing
+
+When an Admin publishes or updates a document:
+
+```text
+Markdown
+   |
+   v
+chunkMarkdown()
+   |
+   v
+logical chunks
+   |
+   v
+Gemini gemini-embedding-001
+   |
+   | RETRIEVAL_DOCUMENT
+   v
+768-dimensional vectors
+   |
+   v
+DocumentChunk.embedding
+```
+
+`chunkMarkdown()` creates chunks whenever Markdown headings (`#`, `##`, `###`) start a new section.
+
+### Query retrieval
+
+For a question such as:
+
+```text
+How do I publish on Builder Center?
+```
+
+the backend performs:
+
+```text
+User question
+      |
+      v
+Gemini gemini-embedding-001
+      |
+      | RETRIEVAL_QUERY
+      v
+768-dimensional query vector
+      |
+      v
+PostgreSQL pgvector
+      |
+      | cosine-distance operator: <=>
+      v
+Top RAG_TOP_K chunks
+      |
+      v
+RAG_MIN_SCORE filtering
+```
+
+The current SQL orders chunks by:
+
+```sql
+dc.embedding <=> query_vector
+```
+
+and calculates the application score as:
+
+```sql
+1 - (dc.embedding <=> query_vector)
+```
+
+Only active documents with non-null embeddings are considered.
+
+### Answer generation
+
+If relevant chunks are found:
+
+```text
+Question + retrieved chunks
+        |
+        v
+ai.js
+        |
+        v
+Gemini chat model
+        |
+        v
+Grounded answer
+```
+
+The prompt instructs Gemini to use only the supplied club documentation and not invent unsupported information.
+
+### Important RAG rule
+
+```text
+Embedding model = finds semantically relevant information
+RAG service = retrieves chunks
+AI.js = generates the answer from retrieved context
+Chat service = coordinates everything
+```
+
+# 12. `RAG_MIN_SCORE`
+
+The relevance cutoff is configurable:
 
 ```env
-DATABASE_URL=your_neon_database_url
-NEON_AUTH_URL=your_neon_auth_url
-NEON_AUTH_JWKS_URL=your_neon_auth_jwks_url
-AI_PROVIDER=local
 RAG_MIN_SCORE=0.35
 ```
 
-Do not commit real secrets to Git.
+Concept:
 
-### Frontend `.env`
+```text
+score < threshold
+    |
+    v
+ignore as weak evidence
+```
+
+```text
+score >= threshold
+    |
+    v
+usable retrieval result
+```
+
+The exact value can be tuned using real project questions.
+
+---
+
+# 14. Vector RAG Configuration
+
+The current backend `.env` uses:
 
 ```env
-VITE_NEON_AUTH_URL=your_neon_auth_url
+AI_PROVIDER=gemini
+
+GEMINI_CHAT_MODEL=gemini-3.5-flash
+GEMINI_EMBED_MODEL=gemini-embedding-001
+
+RAG_TOP_K=3
+RAG_MIN_SCORE=0.35
 ```
 
-The frontend API helper currently falls back to:
+### `RAG_TOP_K`
 
-```text
-http://localhost:5000
-```
-
-or can be configured with:
+Controls how many nearest chunks are retrieved from pgvector.
 
 ```env
-VITE_API_URL=http://localhost:5000
+RAG_TOP_K=3
 ```
 
-## Installation
+### `RAG_MIN_SCORE`
 
-### 1. Clone the repository
+Controls the minimum semantic score accepted after retrieval.
 
-```bash
-git clone https://github.com/ChaitanyaPuliga/Aws-Club.git
-cd Aws-Club
+```env
+RAG_MIN_SCORE=0.35
 ```
 
-### 2. Install backend dependencies
+This is a starting value and should be tuned using real chatbot questions.
 
-```bash
-cd backend
-npm install
-```
+### Embedding dimension
 
-### 3. Generate Prisma Client
-
-```bash
-npx prisma generate
-```
-
-### 4. Prepare the database
-
-Make sure `DATABASE_URL` points to the correct PostgreSQL/Neon database.
-
-For an existing database, use the project's Prisma migrations as appropriate.
-
-### 5. Seed the starter documents
-
-```bash
-npm run db:seed
-```
-
-The seed process creates or updates the eight starter documents and their searchable chunks.
-
-### 6. Start the backend
-
-```bash
-npm run dev
-```
-
-Current local backend port:
+The project uses:
 
 ```text
-http://localhost:5000
+Gemini outputDimensionality = 768
+PostgreSQL = vector(768)
 ```
 
-### 7. Start the frontend
+These values must match.
 
-Open a second terminal:
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-Vite normally serves the frontend at a local development URL such as:
+If Gemini returns 768 values while PostgreSQL expects `vector(1024)`, the insert fails with an error such as:
 
 ```text
-http://localhost:5173
+expected 1024 dimensions, not 768
 ```
 
-## Useful Commands
+When the embedding model or dimension changes, existing document chunks must be re-embedded.
 
-### Backend
 
-```bash
-cd backend
-npm run dev
-npm run start
-npm run db:seed
-npm run db:studio
-npx prisma generate
+# 14. `ai.js` — Answer Generation
+
+This file isolates the Gemini integration from the rest of the chatbot.
+
+Stable functions:
+
+```js
+embedDocument(text, title)
+embedQuery(text)
+generateAnswer(question, context)
 ```
 
-### Frontend
+## Document embeddings
 
-```bash
-cd frontend
-npm run dev
-npm run build
-npm run lint
-npm run preview
+`embedDocument()` calls:
+
+```js
+gemini.models.embedContent()
 ```
 
-## Main API Endpoints
+with:
 
-### Health
-
-```http
-GET /api/health
+```text
+model = gemini-embedding-001
+taskType = RETRIEVAL_DOCUMENT
+outputDimensionality = 768
 ```
 
-### Member documents
+## Query embeddings
 
-```http
-GET /api/documents
+`embedQuery()` calls the same embedding model with:
+
+```text
+taskType = RETRIEVAL_QUERY
+outputDimensionality = 768
 ```
 
-```http
-GET /api/documents/:id
+## Answer generation
+
+The current uploaded code uses:
+
+```js
+gemini.models.generateContent({
+  model: GEMINI_CHAT_MODEL,
+  contents: prompt,
+});
 ```
 
-### Existing chatbot
+The current model configuration is:
+
+```env
+GEMINI_CHAT_MODEL=gemini-3.5-flash
+```
+
+The generated answer is extracted from:
+
+```js
+response.text
+```
+
+### Important implementation status
+
+The current code does **not** use a local LLM.
+
+It also does **not** currently use the Gemini Interactions API. The current implementation uses `models.generateContent()` through `@google/genai`.
+
+This distinction is important when following the documentation against the actual source code.
+
+# 15. Why `ai.js` Exists
+
+Without the provider abstraction:
+
+```text
+chat.service.js
+      |
+      v
+Amazon Bedrock
+```
+
+Switching providers would require modifying core chatbot logic.
+
+With the abstraction:
+
+```text
+chat.service.js
+      |
+      v
+     ai.js
+      |
+      +--> Gemini now
+      |
+      +--> Bedrock later
+```
+
+Everything above `ai.js` can remain stable.
+
+---
+
+# 16. Fallback Handling
+
+Example question:
+
+```text
+What is today's EC2 price?
+```
+
+If the eight club documents do not contain the answer:
+
+```text
+RAG
+  |
+  v
+no strong result
+  |
+  v
+fixed fallback
+```
+
+The backend returns a fixed response similar to:
+
+```text
+I could not find that information in the club documents.
+Please contact the campus AWS Student Builder contact for assistance.
+```
+
+The chatbot should not invent AWS prices, limits, policies, or facts not supported by the documents.
+
+---
+
+# 17. Source Handling
+
+Successful responses include source metadata:
+
+```json
+{
+  "answer": "...",
+  "sources": [
+    {
+      "file": "03-builder-center-publish.md",
+      "section": "Publishing"
+    }
+  ],
+  "fallback": false
+}
+```
+
+The source is derived from the retrieved database chunk:
+
+```text
+DocumentChunk
+    |
+    +-- document.fileName
+    +-- sectionTitle
+```
+
+The model is not trusted to invent source filenames.
+
+---
+
+# 18. Conversation Persistence
+
+Once an answer is generated, the backend stores:
+
+```text
+Message
+role = user
+content = question
+```
+
+and:
+
+```text
+Message
+role = assistant
+content = answer
+```
+
+under the same Conversation.
+
+The existing implementation uses a Prisma transaction to persist the messages and update the conversation timestamp.
+
+Result:
+
+```text
+Conversation
+   |
+   +-- User message
+   +-- Assistant response
+   +-- User message
+   +-- Assistant response
+```
+
+---
+
+# 19. Conversation Ownership
+
+Conversation access is checked against the authenticated user.
+
+Conceptually:
+
+```text
+User A
+  |
+  +--> Conversation A ✅
+
+User B
+  |
+  +--> Conversation A ❌
+```
+
+This is an authorization/ownership check.
+
+Authentication asks:
+
+```text
+Who are you?
+```
+
+Ownership asks:
+
+```text
+Are you allowed to access this conversation?
+```
+
+They are separate concepts.
+
+---
+
+# 20. Stable API
+
+Main chatbot contract:
 
 ```http
 POST /api/chat
-Authorization: Bearer <JWT>
 Content-Type: application/json
+Authorization: Bearer <JWT>
 ```
 
-Request example:
+Request:
+
+```json
+{
+  "message": "When is the next workshop?"
+}
+```
+
+Successful response:
+
+```json
+{
+  "success": true,
+  "answer": "...",
+  "sources": [
+    {
+      "file": "06-workshop-index.md",
+      "section": "Upcoming Workshops"
+    }
+  ],
+  "fallback": false
+}
+```
+
+Fallback response:
+
+```json
+{
+  "success": true,
+  "answer": "I could not find that information in the club documents. Please contact the campus AWS Student Builder contact for assistance.",
+  "sources": [],
+  "fallback": true
+}
+```
+
+The older `/api/chat/ask` endpoint is retained for compatibility with the existing conversation-oriented frontend flow. Both paths use the same chatbot service.
+
+---
+
+# 21. Why the Frontend Does Not Talk Directly to Prisma
+
+Never use:
+
+```text
+React
+  |
+  +--> Prisma
+```
+
+Use:
+
+```text
+React
+  |
+  v
+Backend API
+  |
+  v
+Prisma
+```
+
+This keeps:
+
+- database credentials
+- business logic
+- authentication
+- RAG
+- AI provider credentials
+
+on the backend.
+
+---
+
+# 22. Why AWS Credentials Must Not Be in React
+
+Never do:
+
+```text
+Chat.jsx
+   |
+   +--> AWS secret key
+   +--> Bedrock API
+```
+
+Correct:
+
+```text
+Chat.jsx
+   |
+   v
+Your backend
+   |
+   v
+Bedrock
+```
+
+All AWS access belongs on the backend.
+
+---
+
+# 23. Current Project vs Generic Guide
+
+The earlier generic implementation guide described an in-memory/local RAG index. The current project-specific implementation instead stores embeddings in PostgreSQL pgvector.
+
+Your actual project already has those documents and their chunks in Prisma.
+
+Therefore the project-specific implementation uses:
+
+```text
+Guide concept:
+rag.service.js -> documents / chunks
+
+Your project:
+rag.service.js -> Gemini query embedding -> PostgreSQL pgvector -> DocumentChunk
+```
+
+This avoids a duplicate document store and preserves your existing Documents page and database.
+
+The retrieval interface remains the same conceptually:
+
+```text
+question
+   |
+   v
+relevant chunks
+   |
+   v
+source metadata
+```
+
+---
+
+# 24. Why PostgreSQL pgvector Is Used
+
+The project already uses Neon PostgreSQL, so PostgreSQL pgvector provides semantic vector storage and retrieval without adding another database service.
+
+Current storage:
+
+```text
+Neon PostgreSQL
+   |
+   +-- Document
+   |
+   +-- DocumentChunk
+          |
+          +-- content
+          +-- sectionTitle
+          +-- chunkIndex
+          +-- embedding vector(768)
+```
+
+Current retrieval:
+
+```text
+Question
+   |
+   v
+Gemini embedding
+   |
+   v
+query vector
+   |
+   v
+PostgreSQL pgvector
+   |
+   v
+Top K chunks
+```
+
+The project therefore does not require Pinecone, Chroma, Weaviate, Qdrant, or a local vector database for the current implementation.
+
+# 25. Future Bedrock Architecture
+
+Current:
+
+```text
+Question
+   |
+   v
+RAG
+   |
+   v
+retrieved chunks
+   |
+   v
+ai.js
+   |
+   v
+Gemini cloud generation
+```
+
+Future:
+
+```text
+Question
+   |
+   v
+RAG
+   |
+   v
+retrieved chunks
+   |
+   v
+ai.js
+   |
+   v
+Amazon Bedrock
+```
+
+The rest of the project remains conceptually unchanged.
+
+A future semantic RAG implementation can add embeddings:
+
+```text
+documents
+   |
+   v
+embeddings
+   |
+   v
+vector search
+   |
+   v
+relevant chunks
+   |
+   v
+Bedrock generation
+```
+
+---
+
+# 26. Admin Document Management and Automatic RAG Indexing
+
+The Admin Document Management flow is the project's RAG knowledge-base management workflow.
+
+## New document
+
+When an Admin adds and publishes a document:
+
+```text
+Admin Panel
+    |
+    v
+publishDocument()
+    |
+    +--> chunkMarkdown()
+    |
+    +--> createChunkEmbeddings()
+    |       |
+    |       v
+    |   Gemini embedding
+    |
+    v
+Document + DocumentChunk embeddings
+    |
+    v
+Neon PostgreSQL pgvector
+```
+
+Each chunk receives a 768-dimensional embedding before the transaction stores it.
+
+## Editing an existing document
+
+When an existing document is published again with the same filename, `publishDocument()` updates the existing document, deletes its old chunks, and inserts newly embedded chunks.
+
+The explicit Admin edit path `updateDocument()` performs the same re-indexing behavior: update document metadata, delete old chunks, generate new embeddings, and insert the new vectors.
+
+Therefore, for normal use:
+
+```text
+Admin edits document
+       |
+       v
+Save / Publish
+       |
+       v
+old chunks removed
+       |
+       v
+new chunks created
+       |
+       v
+Gemini embeddings generated
+       |
+       v
+vectors stored in PostgreSQL
+```
+
+A separate indexing script is not required for future documents. A one-time re-indexing process is only useful when migrating an existing knowledge base after changing embedding models or dimensions.
+
+# 27. One Complete Example
+
+Question:
+
+```text
+How do I publish on Builder Center?
+```
+
+## Step 1 — Input
+
+`ChatInput.jsx` captures the question.
+
+## Step 2 — Frontend state
+
+`useChat.js` receives the text.
+
+## Step 3 — HTTP
+
+`apiFetch()` calls:
+
+```text
+POST /api/chat
+```
+
+with the JWT.
+
+## Step 4 — Authentication
+
+`auth.js` verifies the JWT using Neon Auth JWKS.
+
+## Step 5 — Controller
+
+`chat.controller.js` identifies the application profile.
+
+## Step 6 — Conversation
+
+`chat.service.js` finds or creates a Conversation.
+
+## Step 7 — Retrieval
+
+`rag.service.js` searches `DocumentChunk`.
+
+Likely result:
+
+```text
+03-builder-center-publish.md
+Section: Publishing
+```
+
+## Step 8 — Answer generation
+
+`ai.js` sends the question and retrieved context to the configured Gemini chat model and returns the grounded answer.
+
+## Step 9 — Persistence
+
+`chat.service.js` saves:
+
+```text
+User message
+Assistant message
+```
+
+## Step 10 — Response
+
+Backend returns:
+
+```json
+{
+  "answer": "...",
+  "sources": [
+    {
+      "file": "03-builder-center-publish.md",
+      "section": "Publishing"
+    }
+  ],
+  "fallback": false
+}
+```
+
+## Step 11 — React state
+
+`useChat.js` stores the result.
+
+## Step 12 — Display
+
+`ChatWindow.jsx` -> `ChatMessage.jsx` -> `SourceCitation.jsx`.
+
+The user sees the answer and its source.
+
+---
+
+# 27. File Responsibility Table
+
+| File | Main job |
+|---|---|
+| `Chat.jsx` | Chat page composition |
+| `ChatInput.jsx` | User input |
+| `ChatWindow.jsx` | Message list |
+| `ChatMessage.jsx` | Individual message |
+| `SourceCitation.jsx` | Source display |
+| `useChat.js` | Frontend state + API |
+| `api.js` | HTTP + JWT |
+| `MemberLayout.jsx` | Shared member UI |
+| `chat.css` | Chat styling |
+| `chat.routes.js` | URL routing |
+| `auth.js` | JWT verification |
+| `chat.controller.js` | HTTP/controller layer |
+| `users.service.js` | Auth user -> profile |
+| `chat.service.js` | Main orchestration |
+| `rag.service.js` | Retrieval |
+| `ai.js` | Answer generation |
+| `db.js` | Prisma client |
+| `schema.prisma` | Database model definitions |
+
+---
+
+# 28. What to Edit for Different Changes
+
+## UI change
+
+Usually edit:
+
+```text
+Chat.jsx
+ChatWindow.jsx
+ChatMessage.jsx
+ChatInput.jsx
+SourceCitation.jsx
+chat.css
+```
+
+## Search/retrieval change
+
+Edit:
+
+```text
+rag.service.js
+```
+
+## AI provider change
+
+Edit:
+
+```text
+ai.js
+```
+
+## Conversation/database logic
+
+Edit:
+
+```text
+chat.service.js
+chat.controller.js
+```
+
+## Authentication problem
+
+Investigate:
+
+```text
+auth.js
+Neon Auth/JWKS configuration
+```
+
+---
+
+# 29. Debugging Guide
+
+## Error: 401 Unauthorized
+
+Check:
+
+```text
+JWT
+Authorization header
+auth.js
+Neon Auth JWKS
+NEON_AUTH_JWKS_URL
+```
+
+## Error: JWKSTimeout
+
+The request is failing during JWT verification before RAG.
+
+Test JWKS connectivity.
+
+For the issue encountered in this project, the practical startup command that resolved the Node networking path was:
+
+```bash
+NODE_OPTIONS="--dns-result-order=ipv4first" npm run dev
+```
+
+## Error: Prisma delegate undefined
+
+Verify the generated client:
+
+```bash
+npx prisma generate
+```
+
+Then:
+
+```bash
+node -e "const prisma=require('./src/config/db'); console.log('conversation:', typeof prisma.conversation?.create); console.log('message:', typeof prisma.message?.create); console.log('documentChunk:', typeof prisma.documentChunk?.findMany); prisma.$disconnect()"
+```
+
+Expected:
+
+```text
+conversation: function
+message: function
+documentChunk: function
+```
+
+## Error: `expected 1024 dimensions, not 768`
+
+The application generates 768-dimensional Gemini embeddings while PostgreSQL is configured for `vector(1024)`.
+
+The project must use:
+
+```text
+Gemini outputDimensionality = 768
+PostgreSQL embedding = vector(768)
+```
+
+Check `schema.prisma`:
+
+```prisma
+embedding Unsupported("vector(768)")?
+```
+
+Also check the actual Neon column. Existing chunks must be re-embedded after changing the vector dimension.
+
+## Error: `gemini-2.5-flash is no longer available to new users`
+
+The backend is still using an obsolete model value somewhere.
+
+Check:
+
+```bash
+grep -R "gemini-2.5-flash" -n src .env
+```
+
+The current project configuration is:
+
+```env
+GEMINI_CHAT_MODEL=gemini-3.5-flash
+```
+
+Restart the backend after changing `.env`.
+
+## Error: Gemini API key missing
+
+Check:
+
+```env
+GEMINI_API_KEY=your_gemini_api_key
+```
+
+The key must be available to the backend process.
+
+## Error during Admin document save
+
+If document publishing fails while generating embeddings, check:
+
+```text
+GEMINI_API_KEY
+GEMINI_EMBED_MODEL
+network/API access
+vector dimension = 768
+```
+
+Because embeddings are generated before the document transaction completes, a failed embedding request should prevent the document from being indexed as if it were complete.
+
+## Chat returns fallback for everything
+
+Check:
+
+```text
+RAG_MIN_SCORE
+RAG_TOP_K
+DocumentChunk embeddings
+embedding dimension
+pgvector similarity score
+active document status
+```
+
+## Wrong answer
+
+Inspect:
+
+```text
+retrieved chunks
+rag.service.js
+ai.js context
+```
+
+## Sources missing
+
+Inspect:
+
+```text
+rag.service.js
+chat.service.js
+useChat.js
+SourceCitation.jsx
+```
+
+---
+
+# 30. Environment
+
+Current cloud provider:
+
+```env
+AI_PROVIDER=gemini
+```
+
+Gemini configuration:
+
+```env
+GEMINI_API_KEY=your_gemini_api_key
+GEMINI_CHAT_MODEL=gemini-3.5-flash
+GEMINI_EMBED_MODEL=gemini-embedding-001
+```
+
+RAG configuration:
+
+```env
+RAG_TOP_K=3
+RAG_MIN_SCORE=0.35
+```
+
+The Gemini API key must remain in backend environment configuration. Never put it in React or commit it to source control.
+
+The current uploaded `.env` also contains the existing database and Neon Auth variables:
+
+```env
+DATABASE_URL=...
+NEON_AUTH_URL=...
+NEON_AUTH_JWKS_URL=...
+```
+
+Do not expose their secret values in frontend code or documentation.
+
+# 31. Useful Commands
+
+## Backend
+
+```bash
+cd ~/AWS/Aws-Club/backend
+NODE_OPTIONS="--dns-result-order=ipv4first" npm run dev
+```
+
+## Frontend
+
+```bash
+cd ~/AWS/Aws-Club/frontend
+npm run dev
+```
+
+## Prisma Client
+
+```bash
+cd ~/AWS/Aws-Club/backend
+npx prisma generate
+```
+
+## Gemini SDK
+
+```bash
+cd ~/AWS/Aws-Club/backend
+npm install @google/genai@latest
+```
+
+## Check for obsolete model
+
+```bash
+grep -R "gemini-2.5-flash" -n src .env
+```
+
+Expected after migration: no matches.
+
+## Check vector schema
+
+In the Neon SQL editor:
+
+```sql
+SELECT
+  column_name,
+  data_type,
+  udt_name
+FROM information_schema.columns
+WHERE table_name = 'document_chunks';
+```
+
+The embedding column must be a PostgreSQL vector column configured for 768 dimensions.
+
+## Main chatbot API
+
+```text
+POST /api/chat
+```
+
+Example request body:
 
 ```json
 {
@@ -386,204 +1942,197 @@ Request example:
 }
 ```
 
-### Admin document publishing
+---
 
-```http
-POST /api/documents/admin/publish
-Authorization: Bearer <ADMIN_JWT>
-Content-Type: application/json
-```
+# 32. The Three Files to Remember
 
-Example:
+If you forget most of the system, remember these three.
 
-```json
-{
-  "title": "Event Day Briefing",
-  "fileName": "event-day-briefing.md",
-  "description": "Event day schedule and judging details.",
-  "content": "# Event Day Briefing\n\n## Judging\n\nJudging starts at 2 PM."
-}
-```
+## `rag.service.js`
 
-### Admin document update
-
-```http
-PUT /api/documents/admin/:id
-Authorization: Bearer <ADMIN_JWT>
-Content-Type: application/json
-```
-
-Publishing or updating a document automatically rebuilds its `DocumentChunk` rows in a Prisma transaction.
-
-## RAG and Answer Generation
-
-The current retrieval system is deliberately simple and local because the project only has a small number of documents.
+> FIND the information.
 
 ```text
 Question
-   ↓
-Tokenization / lexical scoring
-   ↓
-Active DocumentChunk rows
-   ↓
-Top relevant chunks
-   ↓
-config/ai.js
-   ↓
-Local grounded answer
+   |
+   v
+Gemini query embedding
+   |
+   v
+pgvector
+   |
+   v
+Relevant document chunks
 ```
 
-The AI provider abstraction is kept in `backend/src/config/ai.js`.
+## `ai.js`
 
-Current provider:
-
-```env
-AI_PROVIDER=local
-```
-
-The Bedrock provider is intentionally left as a future integration point rather than putting AWS credentials in the frontend.
-
-## Document Re-indexing
-
-When an administrator publishes or updates a document:
+> TURN the information into an answer.
 
 ```text
-Admin request
-   ↓
-Document create/update
-   ↓
-Delete previous chunks when updating
-   ↓
-Markdown split into logical sections
-   ↓
-Create new DocumentChunk rows
-   ↓
-Commit transaction
+Question + context
+   |
+   v
+Answer
 ```
 
-This makes the newly published content immediately available to the existing RAG search path.
+## `chat.service.js`
 
-## Prisma Studio
+> COORDINATE everything.
 
-To inspect documents and chunks:
+```text
+Question
+   |
+   v
+RAG
+   |
+   +---- no result ----> fallback
+   |
+   +---- result -------> AI
+                         |
+                         v
+                      sources
+                         |
+                         v
+                   save messages
+                         |
+                         v
+                    response
+```
+
+---
+
+# 33. Final Mental Model
+
+Think of the chatbot as a team:
+
+```text
+RAG SERVICE
+"Let me search the official club information."
+
+AI.JS
+"I'll turn the retrieved information into a readable answer."
+
+CHAT SERVICE
+"I'll coordinate both, handle fallback, attach sources,
+save the conversation, and return the result."
+
+CONTROLLER
+"I'll translate the HTTP request into the service call."
+
+AUTH
+"I'll verify who the user is."
+
+REACT
+"I'll collect the question and show the result."
+```
+
+The most important rule is:
+
+```text
+RAG does NOT answer.
+AI does NOT search.
+Controller does NOT contain chatbot business logic.
+React does NOT access Prisma.
+AWS credentials do NOT go into React.
+```
+
+Each layer has one job.
+
+---
+
+# 34. Current Implementation Status
+
+At the time this documentation was written:
+
+```text
+✅ Neon Auth authentication
+✅ JWT verification
+✅ Prisma/PostgreSQL connection
+✅ Eight official documents
+✅ Document chunks
+✅ PostgreSQL pgvector
+✅ Gemini semantic embeddings
+✅ Gemini embedding + PostgreSQL pgvector retrieval
+✅ RAG relevance threshold
+✅ Gemini cloud AI provider abstraction
+✅ Fallback behavior
+✅ Source metadata
+✅ Conversation persistence
+✅ Message persistence
+✅ Protected chat routes
+✅ Frontend chat components
+✅ Stable /api/chat endpoint
+✅ Existing /api/chat/ask compatibility
+✅ Member layout integration
+✅ Bedrock-ready provider separation
+```
+
+The Gemini cloud implementation works without AWS.
+
+The intended future AWS provider change remains isolated behind `ai.js`.
+
+---
+
+# 35. Final One-Line Summary
+
+```text
+Member asks a question
+→ authenticated API request
+→ controller identifies the user
+→ chat.service coordinates
+→ Gemini creates a query embedding
+→ PostgreSQL pgvector retrieves relevant official document chunks
+→ ai.js sends question + context to Gemini
+→ sources are attached
+→ messages are saved in Prisma
+→ React displays the answer and sources
+```
+
+That is the complete chatbot implementation.
+
+# 38. GitHub Release Checklist
+
+Before pushing the project to GitHub:
+
+```text
+[ ] Commit backend/prisma/schema.prisma
+[ ] Commit backend/prisma/migrations/
+[ ] Ensure migrations create vector(768)
+[ ] Commit backend/package.json and package-lock.json
+[ ] Commit frontend/package.json and package-lock.json
+[ ] Commit .env.example files if used
+[ ] Do NOT commit real .env files
+[ ] Do NOT commit GEMINI_API_KEY
+[ ] Do NOT commit database passwords/URLs containing secrets
+[ ] Verify npx prisma migrate deploy works on a fresh database
+[ ] Verify npx prisma generate works
+[ ] Verify backend starts
+[ ] Verify frontend starts
+[ ] Verify Admin document publish creates chunks and embeddings
+[ ] Verify chatbot retrieves the new document
+```
+
+### Clone workflow to document in README
 
 ```bash
+git clone <YOUR_GITHUB_REPOSITORY_URL>
+cd Aws-Club
+
 cd backend
-npm run db:studio
+npm install
+npx prisma migrate deploy
+npx prisma generate
+npm run dev
 ```
 
-Useful tables/models to inspect:
+In another terminal:
 
-- `UserProfile`
-- `Document`
-- `DocumentChunk`
-- `Conversation`
-- `Message`
-
-## Hackathon 30% Integration
-
-The onsite phase requires the portal to add:
-
-1. Admin document add/update.
-2. Re-indexing after publish.
-3. Chat synchronization with the latest document index.
-4. Member document-list synchronization.
-5. `event-day-briefing.md` retrieval and citations.
-6. Three smoke-test questions with pass/fail results.
-7. Evaluator API:
-
-```http
-POST http://<machine-ip>:8080/ask
+```bash
+cd Aws-Club/frontend
+npm install
+npm run dev
 ```
 
-Required request:
+After login, an Admin can publish/update knowledge documents. The application then performs chunking and Gemini embedding automatically.
 
-```json
-{
-  "question": "..."
-}
-```
-
-Required top-level response shape:
-
-```json
-{
-  "answer": "...",
-  "sources": [
-    {
-      "document": "event-day-briefing.md",
-      "rank": 1
-    }
-  ]
-}
-```
-
-The evaluator endpoint must listen on `0.0.0.0:8080` so judges can reach the laptop over the event Wi-Fi.
-
-The current repository state already contains the document publish/re-index backend foundation. The evaluator `/ask` network endpoint and remaining event-day/demo work should be completed before the final hackathon test.
-
-## Security Notes
-
-- Never commit `backend/.env` or frontend secrets.
-- Keep AWS credentials on the backend only.
-- Do not expose database credentials to React.
-- Keep admin authorization enforced by the backend.
-- Do not log passwords, authentication tokens, or private student information.
-
-## Future AWS Integration
-
-The current architecture is intentionally provider-separated so AWS can be integrated later without redesigning the frontend.
-
-A future deployment can map:
-
-```text
-Neon Auth / current auth
-        ↓
-AWS authentication service as appropriate
-
-PostgreSQL / Neon
-        ↓
-AWS-managed persistence if required
-
-config/ai.js local provider
-        ↓
-Amazon Bedrock
-
-Local document storage
-        ↓
-S3 / other AWS storage
-
-Current Express API
-        ↓
-AWS hosting such as App Runner / ECS / Lambda + API Gateway
-```
-
-The important design constraint is to keep frontend code independent of AWS credentials and keep the AI provider abstraction behind `ai.js`.
-
-## Demo Flow
-
-A normal member demo:
-
-1. Open the portal.
-2. Register or sign in.
-3. Open the dashboard.
-4. Open Documents and browse the official club material.
-5. Ask the chatbot a question from the documents.
-6. Show the source document/section.
-7. Ask an unrelated question and show the grounded fallback.
-8. Open My Chats to demonstrate persisted conversations.
-
-Admin/onsite demo:
-
-1. Sign in as an `ADMIN`.
-2. Publish or update a document.
-3. Verify new `DocumentChunk` rows in Prisma.
-4. Ask a question whose answer is in the new document.
-5. Show the source citation.
-6. Run the required smoke tests.
-7. Test `POST /ask` from Thunder Client/curl.
-8. Connect the evaluator test over the event Wi-Fi.
-
-## License
-
-No project license has been specified in the current repository.

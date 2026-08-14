@@ -1,4 +1,8 @@
-const prisma = require("../../config/db");
+const prisma =
+  require("../../config/db");
+
+const ai =
+  require("../../config/ai");
 
 /**
  * Create a short description from the document content.
@@ -47,6 +51,28 @@ function chunkMarkdown(content = "") {
       content: body || part,
     };
   });
+}
+
+async function createChunkEmbeddings(
+  chunks,
+  documentTitle
+) {
+  return Promise.all(
+    chunks.map(async (chunk) => {
+      const embedding =
+        await ai.embedDocument(
+          chunk.content,
+          `${documentTitle} - ${
+            chunk.sectionTitle || ""
+          }`
+        );
+
+      return {
+        ...chunk,
+        embedding,
+      };
+    })
+  );
 }
 
 /**
@@ -133,7 +159,14 @@ async function publishDocument({
   const cleanFileName = fileName.trim();
   const cleanContent = content.trim();
 
-  const chunks = chunkMarkdown(cleanContent);
+const chunks =
+  chunkMarkdown(cleanContent);
+
+const embeddedChunks =
+  await createChunkEmbeddings(
+    chunks,
+    cleanTitle
+  );
 
   if (!chunks.length) {
     const error = new Error(
@@ -203,14 +236,31 @@ async function publishDocument({
     /*
      * Create the new searchable chunks.
      */
-    await tx.documentChunk.createMany({
-      data: chunks.map((chunk) => ({
-        documentId: document.id,
-        chunkIndex: chunk.chunkIndex,
-        sectionTitle: chunk.sectionTitle,
-        content: chunk.content,
-      })),
-    });
+for (const chunk of embeddedChunks) {
+  const vector =
+    `[${chunk.embedding.join(",")}]`;
+
+  await tx.$executeRaw`
+    INSERT INTO "document_chunks" (
+      "id",
+      "documentId",
+      "chunkIndex",
+      "content",
+      "sectionTitle",
+      "embedding",
+      "createdAt"
+    )
+    VALUES (
+      gen_random_uuid(),
+      ${document.id},
+      ${chunk.chunkIndex},
+      ${chunk.content},
+      ${chunk.sectionTitle},
+      ${vector}::vector,
+      NOW()
+    )
+  `;
+}
 
     /*
      * Return the newly indexed document.
@@ -285,7 +335,14 @@ async function updateDocument(
   const cleanFileName = fileName.trim();
   const cleanContent = content.trim();
 
-  const chunks = chunkMarkdown(cleanContent);
+const chunks =
+  chunkMarkdown(cleanContent);
+
+const embeddedChunks =
+  await createChunkEmbeddings(
+    chunks,
+    cleanTitle
+  );
 
   return prisma.$transaction(async (tx) => {
     const existing =
@@ -352,14 +409,31 @@ async function updateDocument(
       },
     });
 
-    await tx.documentChunk.createMany({
-      data: chunks.map((chunk) => ({
-        documentId: id,
-        chunkIndex: chunk.chunkIndex,
-        sectionTitle: chunk.sectionTitle,
-        content: chunk.content,
-      })),
-    });
+for (const chunk of embeddedChunks) {
+  const vector =
+    `[${chunk.embedding.join(",")}]`;
+
+  await tx.$executeRaw`
+    INSERT INTO "document_chunks" (
+      "id",
+      "documentId",
+      "chunkIndex",
+      "content",
+      "sectionTitle",
+      "embedding",
+      "createdAt"
+    )
+    VALUES (
+      gen_random_uuid(),
+      ${id},
+      ${chunk.chunkIndex},
+      ${chunk.content},
+      ${chunk.sectionTitle},
+      ${vector}::vector,
+      NOW()
+    )
+  `;
+}
 
     return tx.document.findUnique({
       where: {

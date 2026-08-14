@@ -1,177 +1,92 @@
-const prisma = require("../config/db");
+const prisma =
+  require("../config/db");
 
-const STOP_WORDS = new Set([
-  "the",
-  "a",
-  "an",
-  "and",
-  "or",
-  "but",
-  "is",
-  "are",
-  "was",
-  "were",
-  "be",
-  "to",
-  "of",
-  "for",
-  "in",
-  "on",
-  "at",
-  "by",
-  "with",
-  "from",
-  "how",
-  "what",
-  "when",
-  "where",
-  "why",
-  "who",
-  "which",
-  "do",
-  "does",
-  "did",
-  "can",
-  "could",
-  "would",
-  "should",
-  "i",
-  "me",
-  "my",
-  "you",
-  "your",
-  "we",
-  "our",
-  "it",
-  "this",
-  "that",
-  "tell",
-  "about",
-]);
+const ai =
+  require("../config/ai");
 
-function tokenize(value = "") {
-  return [
-    ...new Set(
-      String(value)
-        .toLowerCase()
-        .replace(/[^a-z0-9\s]/g, " ")
-        .split(/\s+/)
-        .filter(
-          (word) =>
-            word.length >= 3 &&
-            !STOP_WORDS.has(word)
-        )
-    ),
-  ];
-}
+const TOP_K = Number(
+  process.env.RAG_TOP_K || "3"
+);
 
-function normalize(value = "") {
-  return String(value)
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
+const MIN_SCORE = Number(
+  process.env.RAG_MIN_SCORE || "0.35"
+);
 
-function calculateScore(question, chunk) {
-  const questionTerms = tokenize(question);
-
-  if (!questionTerms.length) {
-    return 0;
+function vectorToString(vector) {
+  if (!Array.isArray(vector) || !vector.length) {
+    throw new Error(
+      "Invalid embedding vector."
+    );
   }
 
-  const sectionText = normalize(
-    chunk.sectionTitle || ""
-  );
-
-  const documentText = normalize(
-    chunk.document?.title || ""
-  );
-
-  const contentText = normalize(
-    chunk.content || ""
-  );
-
-  let matched = 0;
-  let weightedMatches = 0;
-
-  for (const term of questionTerms) {
-    const inSection = sectionText.includes(term);
-    const inTitle = documentText.includes(term);
-    const inContent = contentText.includes(term);
-
-    if (inSection || inTitle || inContent) {
-      matched += 1;
-
-      if (inSection) {
-        weightedMatches += 1.5;
-      } else if (inTitle) {
-        weightedMatches += 1.25;
-      } else {
-        weightedMatches += 1;
-      }
-    }
-  }
-
-  const baseScore = matched / questionTerms.length;
-
-  const weightedScore =
-    weightedMatches /
-    (questionTerms.length * 1.5);
-
-  const exactPhraseBonus =
-    contentText.includes(normalize(question))
-      ? 0.15
-      : 0;
-
-  return Math.min(
-    1,
-    baseScore * 0.65 +
-      weightedScore * 0.2 +
-      exactPhraseBonus
-  );
+  return `[${vector.join(",")}]`;
 }
 
+/**
+ * Semantic vector search using pgvector.
+ */
 async function searchDocuments(question) {
-  const minScore = Number(
-    process.env.RAG_MIN_SCORE || "0.35"
-  );
+  const queryEmbedding =
+    await ai.embedQuery(question);
 
-  const chunks = await prisma.documentChunk.findMany({
-    where: {
-      document: {
-        status: "ACTIVE",
-      },
-    },
-    include: {
-      document: {
-        select: {
-          id: true,
-          title: true,
-          fileName: true,
-        },
-      },
-    },
-  });
+  const vector =
+    vectorToString(queryEmbedding);
 
-  return chunks
-    .map((chunk) => ({
-      id: chunk.id,
-      content: chunk.content,
-      sectionTitle: chunk.sectionTitle,
-      chunkIndex: chunk.chunkIndex,
-      document: chunk.document,
-      score: calculateScore(question, chunk),
+  const rows =
+    await prisma.$queryRaw`
+      SELECT
+        dc.id,
+        dc.content,
+        dc."sectionTitle",
+        dc."chunkIndex",
+
+        d.id AS "documentId",
+        d.title AS "documentTitle",
+        d."fileName" AS "fileName",
+
+        1 - (
+          dc.embedding <=> ${vector}::vector
+        ) AS score
+
+      FROM "document_chunks" dc
+
+      INNER JOIN "documents" d
+        ON d.id = dc."documentId"
+
+      WHERE
+        d.status = 'ACTIVE'
+        AND dc.embedding IS NOT NULL
+
+      ORDER BY
+        dc.embedding <=> ${vector}::vector
+
+      LIMIT ${TOP_K}
+    `;
+
+  return rows
+    .map((row) => ({
+      id: row.id,
+
+      content: row.content,
+
+      sectionTitle:
+        row.sectionTitle,
+
+      chunkIndex:
+        Number(row.chunkIndex),
+
+      document: {
+        id: row.documentId,
+        title: row.documentTitle,
+        fileName: row.fileName,
+      },
+
+      score: Number(row.score),
     }))
-    .filter((chunk) => chunk.score >= minScore)
-    .sort((a, b) => {
-      if (b.score !== a.score) {
-        return b.score - a.score;
-      }
-
-      return a.chunkIndex - b.chunkIndex;
-    })
-    .slice(0, 3);
+    .filter(
+      (chunk) =>
+        chunk.score >= MIN_SCORE
+    );
 }
 
 module.exports = {
